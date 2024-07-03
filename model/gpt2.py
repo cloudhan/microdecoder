@@ -65,13 +65,22 @@ class QKVProj(eqx.Module):
 
   def __init__(self, config: GPT2Config, *, key: PRNGKeyArray | None = None):
     key, _ = jax.random.split(key)
+    # projection operate on head-wise. This should have been as
+    #
+    # self.c_attns = [nn.Linear(head_dim, 3 * head_dim, key=key[h]) for h in range(num_head)]
+    # and then split 3*head_dim output to q, k and v.
+    #
+    # We cannot use vmap because weights are not share between heads, a.k.a., the functions are different.
+    # We need *parallelly* apply multiple functions, not vmap with a single function.
+    #
+    # The following premature optimization fuse all thoes Linears into a single one.
     self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, key=key)
     self.num_head = config.n_head
     self.head_dim = config.n_embd // config.n_head
 
   def __call__(self, x):
 
-    def project_single_x(x):
+    def project_single_x(x):  # each x is H*D
       x = self.c_attn(x)
       # assuming dim of q, k and v are the same
       dim = x.shape[-1] // 3
@@ -103,6 +112,8 @@ class MHA(eqx.Module):
     x = jnp.einsum("shd,thd -> hst", q, k).astype(jnp.float32)
     x = jax.nn.softmax(x * scale).astype(q.dtype)
     x = jnp.einsum("hst,thd -> shd", x, v).reshape(s, h * d)
+    # NOTE: in paper, W^O, the output projection is not omitted. but is fused into V.
+    # Both V and W^O are Linear, thus can be written as a single Linear, mathematically.
     x = self.dropout(x)
     return x
 
@@ -211,8 +222,8 @@ if __name__ == "__main__":
   gpt2 = GPT2(config, key=key)
   input_ids = jnp.repeat(jnp.array([[0, 1, 2, 3, 5]]), 4, axis=0)
 
-  # batch_gpt2 = jax.jit(vmap(gpt2))
   batch_gpt2 = vmap(gpt2)
+  batch_gpt2 = jax.jit(batch_gpt2)
   import time
   start = time.time()
   for i in range(128):
