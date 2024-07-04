@@ -37,7 +37,7 @@ class ReverseDataset(data.Dataset):
       self.data = np.stack(data, axis=0)
 
   def _gen(self):
-    sample_len = self.model_context_len
+    sample_len = self.model_context_len + 1
     remaining_gen_seq_len = sample_len
     sample = []
     while remaining_gen_seq_len > 0:
