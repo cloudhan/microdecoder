@@ -56,6 +56,7 @@ class GPT2Config:
   n_embd: int
   dropout: float
   inference: bool = False
+  vocab_round_up: int = 8
 
 
 class QKVProj(eqx.Module):
@@ -114,7 +115,7 @@ class MHA(eqx.Module):
     x = jnp.einsum("hst,thd -> shd", x, v).reshape(s, h * d)
     # NOTE: in paper, W^O, the output projection is not omitted. but is fused into V.
     # Both V and W^O are Linear, thus can be written as a single Linear, mathematically.
-    x = self.dropout(x)
+    x = self.dropout(x, key=key)
     return x
 
 
@@ -136,10 +137,10 @@ class FFN(eqx.Module):
       x = self.c_fc(x)
       x = jax.nn.gelu(x)
       x = self.c_proj(x)
-      x = self.dropout(x)
+      x = self.dropout(x, key=key)
       return x
 
-    return vmap(call_on_single_x)(x)
+    return vmap(call_on_single_x)(x, key=jax.random.split(key, x.shape[0]))
 
 
 class DecoderBlock(eqx.Module):
@@ -178,16 +179,16 @@ class GPT2(eqx.Module):
 
   def __init__(self, config: GPT2Config, *, key: PRNGKeyArray | None = None):
 
-    def ceil_div(x, y):
+    def multiple_of(x, y):
       return ((x - 1) // y + 1) * y
 
     wpe_key, wte_key, head_key, *keys = jax.random.split(key, num=3 + config.n_layer)
     self.wpe = nn.Embedding(config.n_ctx, config.n_embd, key=wpe_key)
-    self.wte = nn.Embedding(ceil_div(config.n_vocab, 8), config.n_embd, key=wte_key)
+    self.wte = nn.Embedding(multiple_of(config.n_vocab, config.vocab_round_up), config.n_embd, key=wte_key)
     self.dropout = nn.Dropout(config.dropout, inference=config.inference)
     self.decoder_blocks = nn.Sequential([DecoderBlock(config, key=keys[i]) for i in range(config.n_layer)])
     self.ln_f = nn.LayerNorm(config.n_embd)
-    self.lm_head = nn.Linear(config.n_embd, ceil_div(config.n_vocab, 8), key=head_key)
+    self.lm_head = nn.Linear(config.n_embd, multiple_of(config.n_vocab, config.vocab_round_up), key=head_key)
 
   def __call__(self, input_ids, position_ids=None, attention_mask=None, *, key: PRNGKeyArray | None = None):
     key, dropout_key = jax.random.split(key)
@@ -219,16 +220,20 @@ if __name__ == "__main__":
   config = GPT2Config(n_ctx=1024, n_vocab=50304, n_layer=12, n_head=12, n_embd=768, dropout=0.0)
   key = jax.random.PRNGKey(0)
 
+  batch_size = 4
+  seq_len = 5
+
+  print(f"batch_size:{batch_size}, seq_len:{seq_len}, num_vocab:{config.n_vocab}")
+
   gpt2 = GPT2(config, key=key)
-  input_ids = jnp.repeat(jnp.array([[0, 1, 2, 3, 5]]), 4, axis=0)
+  input_ids = jnp.repeat(jnp.array([[0, 1, 2, 3, 5]]), batch_size, axis=0)
 
   batch_gpt2 = vmap(gpt2)
   batch_gpt2 = jax.jit(batch_gpt2)
   import time
   start = time.time()
-  for i in range(128):
-    print(i)
+  for i in range(2):
     output = batch_gpt2(input_ids, key=jax.random.split(key, input_ids.shape[0]))
-    print(output.shape)
+    print(i, output.shape)
   end = time.time()
   print(end - start)

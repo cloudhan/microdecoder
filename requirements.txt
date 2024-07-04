@@ -1,0 +1,10 @@
+jax[cuda12_local]==0.4.30
+equinox
+optax
+
+transformers
+datasets
+
+# for Dataset and DataLoader
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch===2.3.1+cpu
