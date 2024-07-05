@@ -171,27 +171,36 @@ class DecoderBlock(eqx.Module):
 
 class GPT2(eqx.Module):
   wpe: nn.Embedding  # position embedding
-  wte: nn.Embedding  # word (token) embedding
+  # wte: nn.Embedding  # word (token) embedding
   dropout: nn.Dropout
   decoder_blocks: nn.Sequential
   ln_f: nn.LayerNorm
-  lm_head: nn.Linear
+  # lm_head: nn.Linear
+  shared_wte_and_lm_head: nn.Shared
 
   def __init__(self, config: GPT2Config, *, key: PRNGKeyArray | None = None):
 
     def multiple_of(x, y):
       return ((x - 1) // y + 1) * y
 
+    physical_num_vocabs = multiple_of(config.n_vocab, config.vocab_round_up)
+
     wpe_key, wte_key, head_key, *keys = jax.random.split(key, num=3 + config.n_layer)
     self.wpe = nn.Embedding(config.n_ctx, config.n_embd, key=wpe_key)
-    self.wte = nn.Embedding(multiple_of(config.n_vocab, config.vocab_round_up), config.n_embd, key=wte_key)
+    wte = nn.Embedding(multiple_of(config.n_vocab, config.vocab_round_up), config.n_embd, key=wte_key)
     self.dropout = nn.Dropout(config.dropout, inference=config.inference)
     self.decoder_blocks = nn.Sequential([DecoderBlock(config, key=keys[i]) for i in range(config.n_layer)])
     self.ln_f = nn.LayerNorm(config.n_embd)
-    self.lm_head = nn.Linear(config.n_embd, multiple_of(config.n_vocab, config.vocab_round_up), key=head_key)
+    lm_head = nn.Linear(config.n_embd, physical_num_vocabs, use_bias=False, key=head_key)
+    self.shared_wte_and_lm_head = eqx.nn.Shared(
+        (wte, lm_head),
+        lambda mods: mods[0].weight,
+        lambda mods: mods[1].weight,
+    )
 
   def __call__(self, input_ids, position_ids=None, attention_mask=None, *, key: PRNGKeyArray | None = None):
     key, dropout_key = jax.random.split(key)
+    wte, lm_head = self.shared_wte_and_lm_head()
 
     if position_ids is None:
       position_ids = self._gen_position_ids(input_ids.shape[-1])
@@ -199,12 +208,12 @@ class GPT2(eqx.Module):
     if attention_mask is None:
       attention_mask = self._gen_attention_mask(input_ids.shape[-1])
 
-    tok_emb = vmap(self.wpe)(input_ids)
+    tok_emb = vmap(wte)(input_ids)
     pos_emb = vmap(self.wpe)(position_ids)
     x = self.dropout(tok_emb + pos_emb, key=dropout_key)
     x = self.decoder_blocks(x, key=key)
     x = vmap(self.ln_f)(x)
-    logits = vmap(self.lm_head)(x)
+    logits = vmap(lm_head)(x)
     return logits
 
   def _gen_position_ids(self, length):
