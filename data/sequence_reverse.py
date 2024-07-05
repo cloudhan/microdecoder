@@ -22,6 +22,7 @@ class ReverseDataset(data.Dataset):
   def __init__(self, num_categories, max_seq_len, size, np_rng, streaming=False):
     super().__init__()
     self.num_categories = num_categories
+    assert num_categories < 100
     self.max_seq_len = max_seq_len
     self.model_context_len = get_model_context_len(max_seq_len)
     self.size = size
@@ -39,14 +40,18 @@ class ReverseDataset(data.Dataset):
   def _gen(self):
     sample_len = self.model_context_len + 1
     remaining_gen_seq_len = sample_len
-    sample = []
+    data = []
+    mask = []
     while remaining_gen_seq_len > 0:
-      l = self.np_rng.integers(self.max_seq_len)
-      x = self.np_rng.integers(low=2, high=2 + self.num_categories, size=l)
+      l = self.np_rng.integers(self.max_seq_len, dtype=np.int8)
+      x = self.np_rng.integers(low=2, high=2 + self.num_categories, size=l, dtype=np.int8)
       y = np.flip(x, axis=0)
-      sample.extend([x, _bog_token, y, _eog_token])
+      data.extend([x, _bog_token, y, _eog_token])
+      mask.extend([np.zeros_like(x), np.array([0]),  np.ones_like(y), np.array([1])])
       remaining_gen_seq_len -= l * 2 + 2
-    return np.concatenate(sample, axis=0)[:sample_len]
+    data = np.concatenate(data, axis=0)[:sample_len].astype(np.int8)
+    mask = np.concatenate(mask, axis=0)[:sample_len].astype(np.int8)
+    return data, mask
 
   def __len__(self):
     # if self.streaming:
@@ -58,6 +63,9 @@ class ReverseDataset(data.Dataset):
       return self._gen()
     else:
       return self.data[idx]
+
+  def reset():
+    pass
 
 
 def load_dataset(path, split=None, streaming=False):
@@ -82,8 +90,9 @@ def load_dataset(path, split=None, streaming=False):
 def get_dataloader(split, batch_size):
 
   def collate(batch):
-    assert isinstance(batch[0], np.ndarray)
-    return jnp.stack(batch)
+    assert isinstance(batch[0], tuple) and isinstance(batch[0][0], np.ndarray)
+    data, mask = zip(*batch)
+    return jnp.stack(data), jnp.stack(mask)
 
   dataset = load_dataset("sequence_reverse", split=split, streaming=True)
   return data.DataLoader(
@@ -94,9 +103,10 @@ def get_dataloader(split, batch_size):
   )
 
 if __name__ == "__main__":
-  dataloader = get_dataloader("train", 64)
+  dataloader = get_dataloader("train", 4)
 
   for idx, batch in enumerate(dataloader):
     if idx >= 2:
       break
-    print(idx, batch.shape, type(batch))
+    data, mask = batch
+    print(idx, data.shape, mask.shape)
