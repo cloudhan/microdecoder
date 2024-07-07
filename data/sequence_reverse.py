@@ -39,18 +39,21 @@ class ReverseDataset(data.Dataset):
 
   def _gen(self):
     sample_len = self.model_context_len + 1
-    remaining_gen_seq_len = sample_len
-    data = []
-    mask = []
-    while remaining_gen_seq_len > 0:
-      l = self.np_rng.integers(self.max_seq_len, dtype=np.int8)
-      x = self.np_rng.integers(low=2, high=2 + self.num_categories, size=l, dtype=np.int8)
-      y = np.flip(x, axis=0)
-      data.extend([x, _bog_token, y, _eog_token])
-      mask.extend([np.zeros_like(x), np.array([0]),  np.ones_like(y), np.array([1])])
-      remaining_gen_seq_len -= l * 2 + 2
-    data = np.concatenate(data, axis=0)[:sample_len].astype(np.int8)
-    mask = np.concatenate(mask, axis=0)[:sample_len].astype(np.int8)
+    data = np.full(sample_len, fill_value=eog_id, dtype=np.uint8)
+    mask = np.zeros(sample_len, dtype=np.uint8)  # mask for target
+
+    l = self.np_rng.integers(self.max_seq_len)
+    x = self.np_rng.integers(low=2, high=2 + self.num_categories, size=l, dtype=np.uint8)
+    y = np.flip(x, axis=0)
+
+    def fill_buffer(dst, src):
+      if len(dst) < len(src):
+        dst[:len(dst)] = src[:len(dst)]
+      else:
+        dst[:len(src)] = src
+
+    fill_buffer(data, np.concatenate([x, _bog_token, y, _eog_token], axis=0))
+    fill_buffer(mask, np.concatenate([np.zeros_like(x), np.array([0]), np.ones_like(y), np.array([1])], axis=0))
     return data, mask
 
   def __len__(self):
@@ -102,6 +105,7 @@ def get_dataloader(split, batch_size):
       collate_fn=collate,
   )
 
+
 if __name__ == "__main__":
   dataloader = get_dataloader("train", 4)
 
@@ -110,3 +114,4 @@ if __name__ == "__main__":
       break
     data, mask = batch
     print(idx, data.shape, mask.shape)
+    print(idx, data, mask)

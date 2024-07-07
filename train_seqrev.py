@@ -1,3 +1,4 @@
+import functools
 import jax
 from jax import jit, vmap
 import jax.numpy as jnp
@@ -27,7 +28,7 @@ def compute_loss(model, batch, key=None):
   # loss_fn is a mapping: ((batch_size, seq_len, vacab_size), (batch_size, seq_len)) -> (batch_size, seq_len)
   losses = optax.losses.softmax_cross_entropy_with_integer_labels(logits, labels)
   masked_losses = mask * losses
-  return losses.sum() / mask.sum()
+  return masked_losses.sum() / mask.sum()
 
 
 @eqx.filter_jit
@@ -45,8 +46,8 @@ def train(num_epochs, load_prefix=None, save_prefix=None):
       GPT2Config(
           n_ctx=sequence_reverse.get_model_context_len(max_seq_len=64),
           n_vocab=12,
-          n_layer=4,
-          n_head=1,
+          n_layer=8,
+          n_head=8,
           n_embd=32,
           dropout=0.05,
           vocab_round_up=1,  # dont roundup since sequence reverse has very little vocab
@@ -57,16 +58,25 @@ def train(num_epochs, load_prefix=None, save_prefix=None):
   train_dataloader = sequence_reverse.get_dataloader(split="train", batch_size=args.batch_size)
   val_dataloader = sequence_reverse.get_dataloader(split="test_val", batch_size=args.batch_size)
 
-  # optimizer = optax.adam(learning_rate=get_lr_schedule(0.01, 500, 50000))
+  is_decayable = functools.partial(jax.tree_util.tree_map, lambda x: eqx.is_array(x) and x.ndim >= 2)
   optimizer = optax.chain(
     optax.clip_by_global_norm(1.0),
-    optax.adamw(learning_rate=0.001, b1=0.9, b2=0.95, eps=1e-8),
+    optax.adamw(
+      learning_rate=get_lr_schedule(0.001, 512, args.num_epochs * 256),
+      b1=0.9,
+      b2=0.95,
+      eps=1e-8,
+      weight_decay=0.1,
+      mask=is_decayable,
+    ),
+    # optax.adamw(learning_rate=0.001, b1=0.9, b2=0.95, eps=1e-8),
   )
   opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
   if load_prefix is not None:
     model = eqx.tree_deserialise_leaves(f"{load_prefix}.model.eqx", model)
     opt_state = eqx.tree_deserialise_leaves(f"{load_prefix}.opt_state.eqx", opt_state)
+  model = eqx.nn.inference_mode(model, False)
 
   total_step = 0
   for epoch in tqdm(range(1, num_epochs + 1)):
