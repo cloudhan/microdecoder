@@ -108,15 +108,22 @@ class MHA(eqx.Module):
       key: PRNGKeyArray | None = None):
     s, h, d = q.shape
     t, h, d = k.shape  # and v.shape
+    causal_bias = self.causal_mask(s, t) * -10000.0
 
     scale = 1.0 / jnp.sqrt(d)
     x = jnp.einsum("shd,thd -> hst", q, k).astype(jnp.float32)
-    x = jax.nn.softmax(x * scale).astype(q.dtype)
+    x = x * scale + causal_bias
+    x = jax.nn.softmax(x).astype(q.dtype)
     x = jnp.einsum("hst,thd -> shd", x, v).reshape(s, h * d)
     # NOTE: in paper, W^O, the output projection is not omitted. but is fused into V.
     # Both V and W^O are Linear, thus can be written as a single Linear, mathematically.
     x = self.dropout(x, key=key)
     return x
+
+  def causal_mask(self, s, t):
+    s = jnp.arange(s)[:, None]
+    t = jnp.arange(t)[None, :]
+    return (s < t)
 
 
 # https://github.com/openai/gpt-2/blob/9b63575ef4/src/model.py#L115-L120
