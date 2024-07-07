@@ -59,6 +59,12 @@ class GPT2Config:
   vocab_round_up: int = 8
 
 
+GPT2_S = GPT2Config(1024, 50257, 12, 12, 768, 0.0)
+GPT2_M = GPT2Config(1024, 50257, 24, 16, 1024, 0.0)
+GPT2_L = GPT2Config(1024, 50257, 36, 20, 1280, 0.0)
+GPT2_XL = GPT2Config(1024, 50257, 48, 25, 1600, 0.0)
+
+
 class QKVProj(eqx.Module):
   c_attn: nn.Linear
   num_head: int
