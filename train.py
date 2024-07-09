@@ -84,9 +84,16 @@ def get_mini_batches(mini_batch_size, mini_steps, context_len):
       batch[1].reshape(mini_steps, mini_batch_size, context_len),
   )
 
+def count_params(model):
+  weights = eqx.filter(model, eqx.is_array)
+  return sum(x.size for x in jax.tree_util.tree_leaves(weights))
+
+
 def train(num_epochs, load_prefix=None, save_prefix=None):
   key = jax.random.PRNGKey(42)
   model = GPT2(GPT2_S, key=key)
+  param_count = count_params(model)
+  print(f"parameters: {param_count * 1e-6:6.2f}M ({param_count})")
 
   is_decayable = functools.partial(jax.tree_util.tree_map, lambda x: eqx.is_array(x) and x.ndim >= 2)
   optimizer = optax.chain(
