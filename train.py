@@ -86,16 +86,33 @@ def get_mini_batches(mini_batch_size, mini_steps, context_len):
 
 def count_params(model):
   weights = eqx.filter(model, eqx.is_array)
-  return sum(x.size for x in jax.tree_util.tree_leaves(weights))
+  param_count = sum(x.size for x in jax.tree_util.tree_leaves(weights))
+  print(f"parameters: {param_count * 1e-6:6.2f}M ({param_count})")
+
+
+def count_decay_non_decay_params(model, is_decayable):
+  decay, non_decay = eqx.partition(model, is_decayable(model))
+  decay = jax.tree_util.tree_leaves(eqx.filter(decay, eqx.is_array))
+  non_decay = jax.tree_util.tree_leaves(eqx.filter(non_decay, eqx.is_array))
+
+  num_decay_t = len(decay)
+  num_decay_p = sum(x.size for x in decay)
+
+  num_non_decay_t = len(non_decay)
+  num_non_decay_p = sum(x.size for x in non_decay)
+
+  print(f"num decayed parameter tensors: {num_decay_t}, with {num_decay_p} parameters")
+  print(f"num non-decayed parameter tensors: {num_non_decay_t}, with {num_non_decay_p} parameters")
 
 
 def train(num_epochs, load_prefix=None, save_prefix=None):
   key = jax.random.PRNGKey(42)
   model = GPT2(GPT2_S, key=key)
-  param_count = count_params(model)
-  print(f"parameters: {param_count * 1e-6:6.2f}M ({param_count})")
-
   is_decayable = functools.partial(jax.tree_util.tree_map, lambda x: eqx.is_array(x) and x.ndim >= 2)
+
+  count_params(model)
+  count_decay_non_decay_params(model, is_decayable)
+
   optimizer = optax.chain(
       optax.clip_by_global_norm(1.0),
       optax.adamw(
