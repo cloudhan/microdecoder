@@ -1,12 +1,15 @@
 from dataclasses import dataclass
 
+import functools
+import math
+
+import equinox as eqx
+import equinox.nn as nn
 import jax
 import jax.experimental
 import jax.numpy as jnp
 from jax import vmap
 from jaxtyping import PRNGKeyArray
-import equinox as eqx
-import equinox.nn as nn
 
 # [1] Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, and Ilya Sutskever. 2019. Language Models are
 #     Unsupervised Multitask Learners. Retrieved from https://openai.com/research/better-language-models
@@ -55,6 +58,7 @@ class GPT2Config:
   n_head: int
   n_embd: int
   dropout: float
+  bias: bool = False  # Linear and LayerNorm
   inference: bool = False
   vocab_round_up: int = 8
 
@@ -63,6 +67,34 @@ GPT2_S = GPT2Config(1024, 50257, 12, 12, 768, 0.0)
 GPT2_M = GPT2Config(1024, 50257, 24, 16, 1024, 0.0)
 GPT2_L = GPT2Config(1024, 50257, 36, 20, 1280, 0.0)
 GPT2_XL = GPT2Config(1024, 50257, 48, 25, 1600, 0.0)
+
+
+def init(pytree, key, **kwargs):
+  for attr, init_method in kwargs.items():
+    key, init_key = jax.random.split(key)
+    pytree = eqx.tree_at(
+        lambda t: getattr(t, attr, None),
+        pytree,
+        replace_fn=functools.partial(init_method, key=init_key),
+    )
+  return pytree
+
+
+def jax_init_wrapper(jax_init, optional=False):
+  """convert jax.nn initializer instance to accept array, instead of shape and dtype"""
+
+  def eqx_init(w, key=None):
+    if optional and w is None:
+      return None
+    return jax_init(key, w.shape, w.dtype)
+
+  return eqx_init
+
+
+normal_001 = jax_init_wrapper(jax.nn.initializers.normal(0.01))
+normal_002 = jax_init_wrapper(jax.nn.initializers.normal(0.02))
+normal_gpt = lambda n_layer: jax_init_wrapper(jax.nn.initializers.normal(0.02 / math.sqrt(2 * n_layer)))
+zero = jax_init_wrapper(jax.nn.initializers.constant(0.0), optional=True)
 
 
 class QKVProj(eqx.Module):
@@ -81,7 +113,7 @@ class QKVProj(eqx.Module):
     # We need *parallelly* apply multiple functions, not vmap with a single function.
     #
     # The following premature optimization fuse all thoes Linears into a single one.
-    self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, key=key)
+    self.c_attn = init(nn.Linear(config.n_embd, 3 * config.n_embd, use_bias=config.bias, key=key), key, weight=normal_002, bias=zero)
     self.num_head = config.n_head
     self.head_dim = config.n_embd // config.n_head
 
@@ -100,10 +132,14 @@ class QKVProj(eqx.Module):
 
 
 class MHA(eqx.Module):
-  dropout: nn.Dropout
+  attn_dropout: nn.Dropout
+  resid_dropout: nn.Dropout
+  c_proj: nn.Linear  # output projection
 
   def __init__(self, config: GPT2Config, *, key: PRNGKeyArray | None = None):
-    self.dropout = nn.Dropout(config.dropout, inference=config.inference)
+    self.attn_dropout = nn.Dropout(config.dropout, inference=config.inference)
+    self.resid_dropout = nn.Dropout(config.dropout, inference=config.inference)
+    self.c_proj = init(nn.Linear(config.n_embd, config.n_embd, use_bias=config.bias, key=key), key, weight=normal_gpt(config.n_layer), bias=zero)
 
   def __call__(
       self,
@@ -112,6 +148,7 @@ class MHA(eqx.Module):
       v,  # [seqlen_kv, num_head, head_dim]
       *,
       key: PRNGKeyArray | None = None):
+    attn_key, residual_key = jax.random.split(key, 2)
     s, h, d = q.shape
     t, h, d = k.shape  # and v.shape
     causal_bias = self.causal_mask(s, t) * -10000.0
@@ -142,8 +179,8 @@ class FFN(eqx.Module):
 
   def __init__(self, config: GPT2Config, *, key: PRNGKeyArray | None = None):
     fc_key, proj_key = jax.random.split(key)
-    self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, key=fc_key)
-    self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, key=proj_key)
+    self.c_fc = init(nn.Linear(config.n_embd, 4 * config.n_embd, use_bias=config.bias, key=fc_key), key, weight=normal_002, bias=zero)
+    self.c_proj = init(nn.Linear(4 * config.n_embd, config.n_embd, use_bias=config.bias, key=proj_key), key, weight=normal_gpt(config.n_layer), bias=zero)
     self.dropout = nn.Dropout(config.dropout, inference=config.inference)
 
   def __call__(self, x, *, key: PRNGKeyArray | None = None):
@@ -169,8 +206,8 @@ class DecoderBlock(eqx.Module):
     proj_key, attn_key, ffn_key = jax.random.split(key, 3)
     self.proj = QKVProj(config, key=proj_key)
     self.attn = MHA(config, key=attn_key)
-    self.ln1 = nn.LayerNorm(config.n_embd)
-    self.ln2 = nn.LayerNorm(config.n_embd)
+    self.ln1 = nn.LayerNorm(config.n_embd, use_bias=config.bias)
+    self.ln2 = nn.LayerNorm(config.n_embd, use_bias=config.bias)
     self.ffn = FFN(config, key=ffn_key)
 
   def __call__(self, x, *, key: PRNGKeyArray | None = None):
@@ -199,16 +236,16 @@ class GPT2(eqx.Module):
     physical_num_vocabs = multiple_of(config.n_vocab, config.vocab_round_up)
 
     wpe_key, wte_key, head_key, *keys = jax.random.split(key, num=3 + config.n_layer)
-    self.wpe = nn.Embedding(config.n_ctx, config.n_embd, key=wpe_key)
-    wte = nn.Embedding(multiple_of(config.n_vocab, config.vocab_round_up), config.n_embd, key=wte_key)
+    self.wpe = init(nn.Embedding(config.n_ctx, config.n_embd, key=wpe_key), wpe_key, weight=normal_001)
+    wte = init(nn.Embedding(multiple_of(config.n_vocab, config.vocab_round_up), config.n_embd, key=wte_key), wte_key, weight=normal_002)
     self.dropout = nn.Dropout(config.dropout, inference=config.inference)
     self.decoder_blocks = nn.Sequential([DecoderBlock(config, key=keys[i]) for i in range(config.n_layer)])
-    self.ln_f = nn.LayerNorm(config.n_embd)
+    self.ln_f = nn.LayerNorm(config.n_embd, use_bias=config.bias)
     lm_head = nn.Linear(config.n_embd, physical_num_vocabs, use_bias=False, key=head_key)
     self.shared_wte_and_lm_head = eqx.nn.Shared(
         (wte, lm_head),
-        lambda mods: mods[0].weight,
         lambda mods: mods[1].weight,
+        lambda mods: mods[0].weight,
     )
 
   def __call__(self, input_ids, position_ids=None, attention_mask=None, *, key: PRNGKeyArray | None = None):
