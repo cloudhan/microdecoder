@@ -120,10 +120,12 @@ class MHA(eqx.Module):
     x = jnp.einsum("shd,thd -> hst", q, k).astype(jnp.float32)
     x = x * scale + causal_bias
     x = jax.nn.softmax(x).astype(q.dtype)
+    x = self.attn_dropout(x, key=attn_key)
     x = jnp.einsum("hst,thd -> shd", x, v).reshape(s, h * d)
-    # NOTE: in paper, W^O, the output projection is not omitted. but is fused into V.
+    # NOTE: in some paper, W^O, the output projection sometime is omitted. Because it is fused into V.
     # Both V and W^O are Linear, thus can be written as a single Linear, mathematically.
-    x = self.dropout(x, key=key)
+    x = self.resid_dropout(vmap(self.c_proj)(x), key=residual_key)
+
     return x
 
   def causal_mask(self, s, t):
@@ -174,11 +176,9 @@ class DecoderBlock(eqx.Module):
   def __call__(self, x, *, key: PRNGKeyArray | None = None):
     # NOTE: the layer norm is moved
     attn_key, ffn_key = jax.random.split(key)
-    x = vmap(self.ln1)(x)
-    q, k, v = self.proj(x)
+    q, k, v = self.proj(vmap(self.ln1)(x))
     x = x + self.attn(q, k, v, key=attn_key)
-    x = vmap(self.ln2)(x)
-    x = x + self.ffn(x, key=ffn_key)
+    x = x + self.ffn(vmap(self.ln2)(x), key=ffn_key)
     return x
 
 
