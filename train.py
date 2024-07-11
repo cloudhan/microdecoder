@@ -7,7 +7,10 @@ import optax
 import time
 from tqdm import tqdm
 
-from model.gpt2 import GPT2, GPT2Config, GPT2_S, GPT2_M
+import jax_utils
+
+# from model.gpt2 import GPT2, GPT2Config, GPT2_S
+from model.gpt2_mixed import GPT2, GPT2Config, GPT2_S
 
 batch_size = 480
 mini_batch_size = 12
@@ -32,7 +35,7 @@ def get_lr_schedule(base_lr, min_lr, warmup_steps, train_steps):
 def compute_loss(model, batch, key=None):
   input_ids, label_ids = batch
   logits = jax.vmap(model)(input_ids, key=jax.random.split(key, input_ids.shape[0]))
-  losses = optax.losses.softmax_cross_entropy_with_integer_labels(logits, label_ids)
+  losses = optax.losses.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), label_ids)
   return losses.mean()
 
 
@@ -84,34 +87,17 @@ def get_mini_batches(mini_batch_size, mini_steps, context_len):
       batch[1].reshape(mini_steps, mini_batch_size, context_len),
   )
 
-def count_params(model):
-  weights = eqx.filter(model, eqx.is_array)
-  param_count = sum(x.size for x in jax.tree_util.tree_leaves(weights))
-  print(f"parameters: {param_count * 1e-6:6.2f}M ({param_count})")
 
-
-def count_decay_non_decay_params(model, is_decayable):
-  decay, non_decay = eqx.partition(model, is_decayable(model))
-  decay = jax.tree_util.tree_leaves(eqx.filter(decay, eqx.is_array))
-  non_decay = jax.tree_util.tree_leaves(eqx.filter(non_decay, eqx.is_array))
-
-  num_decay_t = len(decay)
-  num_decay_p = sum(x.size for x in decay)
-
-  num_non_decay_t = len(non_decay)
-  num_non_decay_p = sum(x.size for x in non_decay)
-
-  print(f"num decayed parameter tensors: {num_decay_t}, with {num_decay_p} parameters")
-  print(f"num non-decayed parameter tensors: {num_non_decay_t}, with {num_non_decay_p} parameters")
-
-
-def train(num_epochs, load_prefix=None, save_prefix=None):
+def train(num_epochs, load_prefix=None, save_prefix=None, mixed_precision=True):
   key = jax.random.PRNGKey(42)
   model = GPT2(GPT2_S, key=key)
-  is_decayable = functools.partial(jax.tree_util.tree_map, lambda x: eqx.is_array(x) and x.ndim >= 2)
 
-  count_params(model)
-  count_decay_non_decay_params(model, is_decayable)
+  if mixed_precision:
+    # model = cast_emb(model, jnp.float16)
+    model = jax_utils.cast_fp32(model, jnp.bfloat16)
+
+  jax_utils.count_params(model)
+  jax_utils.count_decay_non_decay_params(model, jax_utils.is_decayable)
 
   optimizer = optax.chain(
       optax.clip_by_global_norm(1.0),
@@ -119,9 +105,10 @@ def train(num_epochs, load_prefix=None, save_prefix=None):
           learning_rate=get_lr_schedule(6e-4, 6e-5, 2000, 19000),
           b1=0.9,
           b2=0.95,
-          eps=1e-8,
+          eps=1e-5,
           weight_decay=0.1,
-          mask=is_decayable,
+          mask=jax_utils.is_decayable,
+          mu_dtype=jnp.bfloat16,
       ),
   )
   opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
