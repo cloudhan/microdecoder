@@ -39,16 +39,14 @@ def infer_topk(model, input_ids_list, context_len=80, topk=5):
   input_ids = jnp.array([input_ids])
   logp = jnp.zeros((1,), dtype=jnp.float32)
 
-  # model = eqx.filter_jit(jax.vmap(model))
-  model = jax.vmap(model)
-  # sample_step = jax.jit(jax.vmap(sample_step, in_axes=(0,0,0,None)))
-  sample_step = jax.vmap(sample_step, in_axes=(0, 0, 0, None))
+  batch_model = eqx.filter_jit(jax.vmap(lambda x: model(x, key= jax.random.PRNGKey(0))))
+  sample_step = jax.jit(jax.vmap(sample_step, in_axes=(0,0,0,None)))
 
   key = jax.random.PRNGKey(0)
 
   while length < context_len:
     with jax.default_matmul_precision("float32"):
-      logits = model(input_ids, key=jax.random.split(key, logp.shape[0]))
+      logits = batch_model(input_ids)
 
     input_ids, logp = sample_step(input_ids, logits, logp, length)
     input_ids = jnp.reshape(input_ids, (-1, context_len))
