@@ -1,23 +1,48 @@
 import equinox as eqx
-import functools
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 import time
-from tqdm import tqdm
+import tiktoken
 
 import jax_utils
 
 from model.gpt2 import GPT2, GPT2_S
+from infer import infer_topk
 
 batch_size = 480
 mini_batch_size = 12
 context_len = 1024
-num_epochs = 25
 
 mini_steps = batch_size // mini_batch_size
 assert batch_size % mini_batch_size == 0
+
+decode_interval = 200
+loss_acc_interval = 350
+checkpoint_interval = 500
+
+
+# dataset = "tinyshakespeare"
+dataset = "finewebedu"
+
+if dataset == "tinyshakespeare":
+  from data.tinyshakespeare import get_dataloader
+  visualize_prompt = "First Citizen:\n"
+if dataset == "finewebedu":
+  from data.finewebedu import get_dataloader
+  # visualize_prompt = "JAX is a Python library "
+  visualize_prompt = "A language model is a "
+
+
+def infer_print(model):
+  enc = tiktoken.get_encoding("gpt2")
+  input_ids_list = enc.encode_ordinary(visualize_prompt)
+
+  topk = 4
+  output_ids, length = infer_topk(model, input_ids_list, context_len=64, topk=topk)
+  print("input:", repr(enc.decode(input_ids_list)))
+  for i in range(topk):
+    print(f"output[{i}]:", repr(enc.decode(output_ids[i, len(input_ids_list):length])))
 
 
 def get_lr_schedule(base_lr, min_lr, warmup_steps, train_steps):
@@ -69,25 +94,15 @@ def train_step(model, mini_batches, optimizer, opt_state, key=None):
   return loss, model, opt_state
 
 
-def get_batch(batch_size, context_len):
-  # reuse nanoGPT code for now
-  data = np.memmap('train.bin', dtype=np.uint16, mode='r')
-  ix = np.random.randint(len(data) - context_len, size=(batch_size,))
-  x = np.stack([(data[i:i + context_len]).astype(np.int64) for i in ix])
-  y = np.stack([(data[i + 1:i + 1 + context_len]).astype(np.int64) for i in ix])
-  x, y = jnp.array(x), jnp.array(y)
-  return x, y
-
-
-def get_mini_batches(mini_batch_size, mini_steps, context_len):
-  batch = get_batch(mini_batch_size * mini_steps, context_len)
+def to_mini_batches(batch, mini_batch_size, mini_steps):
+  x, y = batch
   return (
-      batch[0].reshape(mini_steps, mini_batch_size, context_len),
-      batch[1].reshape(mini_steps, mini_batch_size, context_len),
+      x.reshape(mini_steps, mini_batch_size, x.shape[-1]),
+      y.reshape(mini_steps, mini_batch_size, y.shape[-1]),
   )
 
 
-def train(num_epochs, load_prefix=None, save_prefix=None, mixed_precision=True):
+def train(load_prefix=None, save_prefix=None, mixed_precision=True):
   key = jax.random.PRNGKey(42)
 
   if mixed_precision:
@@ -124,32 +139,34 @@ def train(num_epochs, load_prefix=None, save_prefix=None, mixed_precision=True):
 
   num_tokens_per_batch = batch_size * context_len
   tokens_trained_on = 0
+  loss_acc = 0
+  step = 0
 
-  total_step = 0
-  for epoch in tqdm(range(1, num_epochs + 1)):
-    loss_acc = 0
-    step = 0
-    while step < 256:
-      step_start_time = time.time()
-      step += 1
-      mini_batches = get_mini_batches(mini_batch_size, mini_steps, context_len)
-    #   break
-    # while True:
-      key, train_step_key = jax.random.split(key)
-      loss, model, opt_state = train_step(model, mini_batches, optimizer, opt_state, key=train_step_key)
-      loss_acc += loss
-      total_step += 1
-      step_end_time = time.time()
-      duration_ms = (step_end_time - step_start_time) * 1000
-      tokens_trained_on += num_tokens_per_batch
-      print(f"Epoch[{epoch}] | step:{step:5d} | loss:{loss:6.4f} | "
-            f"tokens:{tokens_trained_on*1e-9:6.4f}B | step time:{duration_ms:4.2f}ms ")
+  step_start_time, step_end_time = time.time(), time.time()
+  for step, batch in enumerate(get_dataloader(batch_size, context_len)):
+    if step % decode_interval == 0:
+      infer_print(model)
 
-    if save_prefix is not None:
-      eqx.tree_serialise_leaves(f"{save_prefix}.{total_step:06d}.model.eqx", model)
-      eqx.tree_serialise_leaves(f"{save_prefix}.{total_step:06d}.opt_state.eqx", opt_state)
+    if step % loss_acc_interval == 0:
+      print(f"step:{step:5d} | loss acc ({loss_acc_interval} steps):{loss_acc}")
+      loss_acc = 0
 
-    print(f"Epoch[{epoch}] | step:{total_step} | loss acc:{loss_acc}")
+    if step % checkpoint_interval == 0 and step != 0 and save_prefix is not None:
+        eqx.tree_serialise_leaves(f"{save_prefix}.{step:06d}.model.eqx", model)
+        eqx.tree_serialise_leaves(f"{save_prefix}.{step:06d}.opt_state.eqx", opt_state)
+
+    mini_batches = to_mini_batches(batch, mini_batch_size, mini_steps)
+    key, train_step_key = jax.random.split(key)
+    loss, model, opt_state = train_step(model, mini_batches, optimizer, opt_state, key=train_step_key)
+    duration_ms = (step_end_time - step_start_time) * 1000
+    print(f"step:{step:5d} | loss:{loss:6.4f} | tokens:{tokens_trained_on*1e-9:6.4f}B | step time:{duration_ms:4.2f}ms ")
+
+    # ------------------------------------
+    tokens_trained_on += num_tokens_per_batch
+    step_start_time, step_end_time = step_end_time, time.time()
+    step += 1
+    loss_acc += loss
+
 
 
 if __name__ == "__main__":
@@ -160,4 +177,4 @@ if __name__ == "__main__":
   parser.add_argument("--no_mixed_precision", default=False, action="store_true")
   args = parser.parse_args()
 
-  train(num_epochs, args.load_prefix, args.save_prefix, mixed_precision=not args.no_mixed_precision)
+  train(args.load_prefix, args.save_prefix, mixed_precision=not args.no_mixed_precision)

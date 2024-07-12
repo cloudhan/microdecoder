@@ -4,3 +4,4 @@ __pycache__
 *.eqx
 *.npy
 *.txt
+*.log
