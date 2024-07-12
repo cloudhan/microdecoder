@@ -62,9 +62,12 @@ def infer_topk(model, input_ids_list, context_len=80, topk=5):
 
 if __name__ == "__main__":
   import tiktoken
-  from model.gpt2_mixed import GPT2, GPT2_S
+  from model.gpt2 import GPT2, GPT2_S
 
   import jax_utils
+
+  GPT2_S.act_dtype = jnp.bfloat16
+  GPT2_S.emb_dtype = jnp.float16
 
   model = GPT2(GPT2_S, key=jax.random.PRNGKey(0))
   model = jax_utils.cast_fp32(model, jnp.bfloat16)

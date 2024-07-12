@@ -9,8 +9,7 @@ from tqdm import tqdm
 
 import jax_utils
 
-# from model.gpt2 import GPT2, GPT2Config, GPT2_S
-from model.gpt2_mixed import GPT2, GPT2Config, GPT2_S
+from model.gpt2 import GPT2, GPT2_S
 
 batch_size = 480
 mini_batch_size = 12
@@ -90,10 +89,13 @@ def get_mini_batches(mini_batch_size, mini_steps, context_len):
 
 def train(num_epochs, load_prefix=None, save_prefix=None, mixed_precision=True):
   key = jax.random.PRNGKey(42)
+
+  if mixed_precision:
+    GPT2_S.act_dtype = jnp.bfloat16
+    GPT2_S.emb_dtype = jnp.float16
   model = GPT2(GPT2_S, key=key)
 
   if mixed_precision:
-    # model = cast_emb(model, jnp.float16)
     model = jax_utils.cast_fp32(model, jnp.bfloat16)
 
   jax_utils.count_params(model)
@@ -108,7 +110,9 @@ def train(num_epochs, load_prefix=None, save_prefix=None, mixed_precision=True):
           eps=1e-5,
           weight_decay=0.1,
           mask=jax_utils.is_decayable,
-          mu_dtype=jnp.bfloat16,
+          # NOTE: in mixed precision, acc dtype requires dynamic range to be sufficient high.
+          # default to None cause wte and wpe's acc dtype to be fp16 and then preduce NaN after iteration.
+          mu_dtype=jnp.bfloat16 if mixed_precision else None,
       ),
   )
   opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
@@ -153,6 +157,7 @@ if __name__ == "__main__":
   parser = argparse.ArgumentParser()
   parser.add_argument("--load_prefix", default=None, type=str)
   parser.add_argument("--save_prefix", default=None, type=str)
+  parser.add_argument("--no_mixed_precision", default=False, action="store_true")
   args = parser.parse_args()
 
-  train(num_epochs, args.load_prefix, args.save_prefix)
+  train(num_epochs, args.load_prefix, args.save_prefix, mixed_precision=not args.no_mixed_precision)

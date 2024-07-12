@@ -51,8 +51,6 @@ def count_params(model) -> None:
 
 def count_decay_non_decay_params(model, is_decayable) -> None:
   decay, non_decay = eqx.partition(model, is_decayable(model))
-  print(decay)
-  print(non_decay)
   decay = jax.tree_util.tree_leaves(eqx.filter(decay, eqx.is_array))
   non_decay = jax.tree_util.tree_leaves(eqx.filter(non_decay, eqx.is_array))
 
@@ -64,16 +62,6 @@ def count_decay_non_decay_params(model, is_decayable) -> None:
 
   print(f"num decayed parameter tensors: {num_decay_t}, with {num_decay_p} parameters")
   print(f"num non-decayed parameter tensors: {num_non_decay_t}, with {num_non_decay_p} parameters")
-
-
-def cast_emb(model, dtype):
-  pass
-  # print(jax.tree_util.tree_map(id, model))
-
-  # key_leaves, tree_def = jax.tree_util.tree_flatten_with_path(model)
-  # print(tree_def)
-  # for idx, kl in enumerate(key_leaves):
-  #   print(tree_def[idx], kl[0])
 
 
 def cast_fp32(model, dtype):

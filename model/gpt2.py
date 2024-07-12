@@ -61,6 +61,8 @@ class GPT2Config:
   bias: bool = False  # Linear and LayerNorm
   inference: bool = False
   vocab_round_up: int = 8
+  act_dtype: jnp.dtype = jnp.float32
+  emb_dtype: jnp.dtype = jnp.float32
 
 
 GPT2_S = GPT2Config(1024, 50257, 12, 12, 768, 0.0)
@@ -187,7 +189,7 @@ class FFN(eqx.Module):
 
     def call_on_single_x(x, *, key: PRNGKeyArray | None = None):
       x = self.c_fc(x)
-      x = jax.nn.gelu(x)
+      x = jax.nn.gelu(x.astype(jnp.float32)).astype(jnp.bfloat16)
       x = self.c_proj(x)
       x = self.dropout(x, key=key)
       return x
@@ -206,16 +208,17 @@ class DecoderBlock(eqx.Module):
     proj_key, attn_key, ffn_key = jax.random.split(key, 3)
     self.proj = QKVProj(config, key=proj_key)
     self.attn = MHA(config, key=attn_key)
-    self.ln1 = nn.LayerNorm(config.n_embd, use_bias=config.bias)
-    self.ln2 = nn.LayerNorm(config.n_embd, use_bias=config.bias)
+    self.ln1 = nn.LayerNorm(config.n_embd, use_bias=config.bias, dtype=jnp.bfloat16)
+    self.ln2 = nn.LayerNorm(config.n_embd, use_bias=config.bias, dtype=jnp.bfloat16)
     self.ffn = FFN(config, key=ffn_key)
 
   def __call__(self, x, *, key: PRNGKeyArray | None = None):
     # NOTE: the layer norm is moved
     attn_key, ffn_key = jax.random.split(key)
-    q, k, v = self.proj(vmap(self.ln1)(x))
+    act_dtype = x.dtype
+    q, k, v = self.proj(vmap(self.ln1)(x.astype(jnp.float32)).astype(act_dtype))
     x = x + self.attn(q, k, v, key=attn_key)
-    x = x + self.ffn(vmap(self.ln2)(x), key=ffn_key)
+    x = x + self.ffn(vmap(self.ln2)(x.astype(jnp.float32)).astype(act_dtype), key=ffn_key)
     return x
 
 
@@ -227,6 +230,7 @@ class GPT2(eqx.Module):
   ln_f: nn.LayerNorm
   # lm_head: nn.Linear
   # shared_wte_and_lm_head: nn.Shared
+  act_dtype: jnp.dtype
 
   def __init__(self, config: GPT2Config, *, key: PRNGKeyArray | None = None):
 
@@ -236,12 +240,13 @@ class GPT2(eqx.Module):
     physical_num_vocabs = multiple_of(config.n_vocab, config.vocab_round_up)
 
     wpe_key, wte_key, head_key, *keys = jax.random.split(key, num=3 + config.n_layer)
-    self.wpe = init(nn.Embedding(config.n_ctx, config.n_embd, key=wpe_key), wpe_key, weight=normal_001)
-    self.wte = init(nn.Embedding(physical_num_vocabs, config.n_embd, key=wte_key), wte_key, weight=normal_002)
+    self.wpe = init(nn.Embedding(config.n_ctx, config.n_embd, dtype=config.emb_dtype, key=wpe_key), wpe_key, weight=normal_001)
+    self.wte = init(nn.Embedding(physical_num_vocabs, config.n_embd, dtype=config.emb_dtype, key=wte_key), wte_key, weight=normal_002)
     self.dropout = nn.Dropout(config.dropout, inference=config.inference)
     self.decoder_blocks = nn.Sequential([DecoderBlock(config, key=keys[i]) for i in range(config.n_layer)])
     self.ln_f = nn.LayerNorm(config.n_embd, use_bias=config.bias)
     # self.lm_head = nn.Linear(config.n_embd, physical_num_vocabs, use_bias=False, key=head_key)
+    self.act_dtype = config.act_dtype
 
 
   def __call__(self, input_ids, position_ids=None, attention_mask=None, *, key: PRNGKeyArray | None = None):
@@ -255,10 +260,10 @@ class GPT2(eqx.Module):
 
     tok_emb = vmap(self.wte)(input_ids)
     pos_emb = vmap(self.wpe)(position_ids)
-    x = self.dropout(tok_emb + pos_emb, key=dropout_key)
+    x = self.dropout(tok_emb + pos_emb, key=dropout_key).astype(self.act_dtype)
     x = self.decoder_blocks(x, key=key)
-    x = vmap(self.ln_f)(x)
-    logits = x @ self.wte.weight.T  # share wte weight
+    x = vmap(self.ln_f)(x.astype(jnp.float32)).astype(self.act_dtype)
+    logits = jnp.matmul(x, self.wte.weight.T, preferred_element_type=x.dtype)  # lm_head share wte weight
     return logits
 
   def _gen_position_ids(self, length):
@@ -271,23 +276,33 @@ class GPT2(eqx.Module):
 
 
 if __name__ == "__main__":
-  config = GPT2Config(n_ctx=1024, n_vocab=50304, n_layer=12, n_head=12, n_embd=768, dropout=0.0)
+  import optax
+  import jax_utils
+
+  config = GPT2Config(n_ctx=42, n_vocab=3000, n_layer=1, n_head=2, n_embd=128, dropout=0.0, act_dtype=jnp.bfloat16, emb_dtype=jnp.float16)
   key = jax.random.PRNGKey(0)
 
   batch_size = 4
-  seq_len = 5
+  seq_len = 42
 
   print(f"batch_size:{batch_size}, seq_len:{seq_len}, num_vocab:{config.n_vocab}")
 
-  gpt2 = GPT2(config, key=key)
-  input_ids = jnp.repeat(jnp.array([[0, 1, 2, 3, 5]]), batch_size, axis=0)
+  model = GPT2(config, key=key)
+  model = jax_utils.cast_fp32(model, jnp.bfloat16)
 
-  batch_gpt2 = vmap(gpt2)
-  batch_gpt2 = jax.jit(batch_gpt2)
-  import time
-  start = time.time()
-  for i in range(2):
-    output = batch_gpt2(input_ids, key=jax.random.split(key, input_ids.shape[0]))
-    print(i, output.shape)
-  end = time.time()
-  print(end - start)
+  @eqx.filter_jit
+  @eqx.filter_value_and_grad(allow_int=True)
+  def compute_loss(model, params, batch, key=None):
+    model = eqx.combine(params, model)
+    input_ids, label_ids = batch
+    logits = jax.vmap(model)(input_ids, key=jax.random.split(key, input_ids.shape[0]))
+    losses = optax.losses.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), label_ids)
+    return losses.mean()
+
+  key = jax.random.PRNGKey(0)
+  input_ids = jnp.zeros((4, 42), dtype=jnp.int32)
+  label_ids = jnp.ones((4, 42), dtype=jnp.int32)
+
+  params, model = eqx.partition(model, eqx.is_array)
+  f = functools.partial(compute_loss, model, key=key)
+  jax_utils.print_fwd_bwd(f, params, (input_ids, label_ids))
