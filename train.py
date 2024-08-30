@@ -17,9 +17,10 @@ context_len = 1024
 mini_steps = batch_size // mini_batch_size
 assert batch_size % mini_batch_size == 0
 
-decode_interval = 200
-loss_acc_interval = 350
-checkpoint_interval = 500
+decode_interval = 400
+loss_acc_interval = 300
+checkpoint_interval = 1000
+max_train_steps = 40000
 
 
 # dataset = "tinyshakespeare"
@@ -89,7 +90,7 @@ def train_step(model, mini_batches, optimizer, opt_state, key=None):
   grad = jax.tree_util.tree_map(lambda x: scale * x, grad)
 
   updates, opt_state = optimizer.update(grad, opt_state, model)
-  # model = optax.apply_updates(model, updates)
+  updates = jax.tree_util.tree_map(lambda x, y: x.astype(y.dtype), eqx.filter(updates, eqx.is_array), eqx.filter(model, eqx.is_array))
   model = eqx.apply_updates(model, updates)
   return loss, model, opt_state
 
@@ -119,7 +120,7 @@ def train(load_prefix=None, save_prefix=None, mixed_precision=True):
   optimizer = optax.chain(
       optax.clip_by_global_norm(1.0),
       optax.adamw(
-          learning_rate=get_lr_schedule(6e-4, 6e-5, 2000, 19000),
+          learning_rate=get_lr_schedule(6e-4, 6e-5, 2000, max_train_steps),
           b1=0.9,
           b2=0.95,
           eps=1e-5,
@@ -142,8 +143,13 @@ def train(load_prefix=None, save_prefix=None, mixed_precision=True):
   loss_acc = 0
   step = 0
 
+  dl = get_dataloader(batch_size, context_len)
+
   step_start_time, step_end_time = time.time(), time.time()
-  for step, batch in enumerate(get_dataloader(batch_size, context_len)):
+  while True:
+    if step > max_train_steps:
+      break
+
     if step % decode_interval == 0:
       infer_print(model)
 
@@ -155,18 +161,17 @@ def train(load_prefix=None, save_prefix=None, mixed_precision=True):
         eqx.tree_serialise_leaves(f"{save_prefix}.{step:06d}.model.eqx", model)
         eqx.tree_serialise_leaves(f"{save_prefix}.{step:06d}.opt_state.eqx", opt_state)
 
-    mini_batches = to_mini_batches(batch, mini_batch_size, mini_steps)
+    mini_batches = to_mini_batches(next(dl), mini_batch_size, mini_steps)
     key, train_step_key = jax.random.split(key)
     loss, model, opt_state = train_step(model, mini_batches, optimizer, opt_state, key=train_step_key)
-    duration_ms = (step_end_time - step_start_time) * 1000
-    print(f"step:{step:5d} | loss:{loss:6.4f} | tokens:{tokens_trained_on*1e-9:6.4f}B | step time:{duration_ms:4.2f}ms ")
 
     # ------------------------------------
     tokens_trained_on += num_tokens_per_batch
     step_start_time, step_end_time = step_end_time, time.time()
     step += 1
     loss_acc += loss
-
+    duration_ms = (step_end_time - step_start_time) * 1000
+    print(f"step:{step:5d} | loss:{loss:6.4f} | tokens:{tokens_trained_on*1e-9:6.4f}B | step time:{duration_ms:4.2f}ms ")
 
 
 if __name__ == "__main__":
@@ -177,4 +182,5 @@ if __name__ == "__main__":
   parser.add_argument("--no_mixed_precision", default=False, action="store_true")
   args = parser.parse_args()
 
+  jax_utils.config()
   train(args.load_prefix, args.save_prefix, mixed_precision=not args.no_mixed_precision)

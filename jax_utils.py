@@ -1,3 +1,4 @@
+import os
 import functools
 
 import equinox as eqx
@@ -8,6 +9,15 @@ import jax.tree_util as jtu
 from rich.console import Console
 from rich.table import Table
 import rich.text
+
+def config():
+  this_dir = os.path.abspath(os.path.dirname(__file__))
+  jax.config.update("jax_compilation_cache_dir", f"{this_dir}/jax_cache")
+
+  jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+  jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+  jax.config.update("jax_explain_cache_misses", True)
+
 
 def print_fwd_bwd(f, *args, jupyter=False, **kwargs) -> None:
   args, in_tree = jtu.tree_flatten((args, kwargs))
